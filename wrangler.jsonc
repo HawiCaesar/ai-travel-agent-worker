@@ -11,7 +11,7 @@
 		"enabled": true
 	},
 	"vars": {
-		"ALLOWED_ORIGINS": "http://localhost:5173,https://hawiz-ai-travel-agent.netlify.app/",
+		"ALLOWED_ORIGINS": "http://localhost:5173,https://hawiz-ai-travel-agent.netlify.app",
 	}
 	/**
 	 * Smart Placement
