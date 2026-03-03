@@ -7,6 +7,7 @@
 	"name": "ai-travel-agent-worker",
 	"main": "src/index.ts",
 	"compatibility_date": "2025-11-17",
+	"compatibility_flags": ["nodejs_compat"],
 	"observability": {
 		"enabled": true
 	},

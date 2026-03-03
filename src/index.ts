@@ -1,7 +1,8 @@
 import OpenAI from 'openai';
 import { z } from 'zod';
 import { createOpenAI } from '@ai-sdk/openai';
-import { generateText, Output, stepCountIs } from 'ai';
+import { generateText, Output } from 'ai';
+import { Opik, Trace } from 'opik';
 
 // ============================================
 // Environment Types
@@ -12,6 +13,9 @@ interface Env {
 	CLOUDFLARE_GATEWAY_URL: string;
 	OPENWEATHER_API_KEY: string;
 	ALLOWED_ORIGINS: string;
+	OPIK_API_KEY: string;
+	OPIK_WORKSPACE?: string;
+	OPIK_PROJECT_NAME?: string;
 }
 
 // ============================================
@@ -103,7 +107,8 @@ const isOriginAllowed = (origin: string | null, allowedOrigins: string[]): boole
 const generateLogisticsPlanBasedOnUserInputToolCall = async (
 	apiKey: string,
 	baseURL: string,
-	userInput: string
+	userInput: string,
+	parentTrace: Trace
 ): Promise<TravelPlan> => {
 	// Parse the user input to extract travel details
 	const parsedInput = JSON.parse(userInput);
@@ -114,8 +119,21 @@ const generateLogisticsPlanBasedOnUserInputToolCall = async (
 		baseURL,
 	});
 
+	const span = parentTrace.span({
+		name: 'generate-logistics-plan',
+		type: 'llm',
+		input: {
+			destination: parsedInput.destination,
+			origin: parsedInput.flyingFrom,
+			travelers: parsedInput.travelers,
+			budget: parsedInput.budget,
+			tripType: parsedInput.tripType,
+		},
+		metadata: { model: 'gpt-4o' },
+	});
+
 	// Use generateText with Output.object for structured output with type safety
-	const { output } = await generateText({
+	const { output, usage } = await generateText({
 		model: openai('gpt-4o'),
 		output: Output.object({
 			schema: travelPlanSchema,
@@ -142,10 +160,20 @@ For flightRecommendation, use format like: "The best option for you is with Delt
 For hotelRecommendation, use format like: "We recommend you stay at the 4 star Premiere Inn hotel in central Paris, priced at $800"`,
 	});
 
+	span.update({
+		output,
+		usage: {
+			prompt_tokens: usage.inputTokens ?? 0,
+			completion_tokens: usage.outputTokens ?? 0,
+			total_tokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
+		},
+	});
+	span.end();
+
 	return output;
 };
 
-const getCurrentWeather = async (destination: string, env: Env, apiKey: string, baseURL: string) => {
+const getCurrentWeather = async (destination: string, env: Env, apiKey: string, baseURL: string, parentTrace: Trace) => {
 	// Get destination coordinates
 	const geoResponse = await fetch(
 		`http://api.openweathermap.org/geo/1.0/direct?q=${destination}&limit=1&appid=${env.OPENWEATHER_API_KEY}`
@@ -184,8 +212,19 @@ const getCurrentWeather = async (destination: string, env: Env, apiKey: string, 
 	};
 
 	// Generate structured weather description using Vercel AI SDK
+	const weatherSpan = parentTrace.span({
+		name: 'generate-weather-description',
+		type: 'llm',
+		input: {
+			destination,
+			temperature: weatherData.current.temp,
+			conditions: weatherData.current.weather[0].description,
+		},
+		metadata: { model: 'gpt-4o' },
+	});
+
 	try {
-		const { output } = await generateText({
+		const { output, usage } = await generateText({
 			model: openai('gpt-4o'),
 			output: Output.object({
 				schema: weatherDescriptionSchema,
@@ -202,12 +241,34 @@ Do NOT use the timezone property for the city name.`,
 		finalWeatherDetails.description = output.description;
 		finalWeatherDetails.temperature = output.temperature;
 		finalWeatherDetails.conditions = output.conditions;
+
+		weatherSpan.update({
+			output,
+			usage: {
+				prompt_tokens: usage.inputTokens ?? 0,
+				completion_tokens: usage.outputTokens ?? 0,
+				total_tokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
+			},
+		});
+		weatherSpan.end();
 	} catch (error) {
+		weatherSpan.update({ metadata: { error: (error as Error).message } });
+		weatherSpan.end();
 		console.error(error, 'ERROR GETTING WEATHER DESCRIPTION AT DESTINATION');
 		return finalWeatherDetails;
 	}
 
 	// Generate weather image using OpenAI SDK (DALL-E)
+	const imageSpan = parentTrace.span({
+		name: 'generate-weather-image',
+		type: 'llm',
+		input: {
+			prompt: `Generate a beautiful image representing this weather: ${weatherData.current.weather[0].description} in ${destination}`,
+			model: 'dall-e-3',
+		},
+		metadata: { model: 'dall-e-3', provider: 'openai' },
+	});
+
 	try {
 		const openaiClient = new OpenAI({
 			apiKey,
@@ -221,7 +282,11 @@ Do NOT use the timezone property for the city name.`,
 			n: 1,
 		});
 		finalWeatherDetails.imageUrl = image?.data?.[0]?.url || '';
+		imageSpan.update({ output: { imageUrl: finalWeatherDetails.imageUrl } });
+		imageSpan.end();
 	} catch (error) {
+		imageSpan.update({ metadata: { error: (error as Error).message } });
+		imageSpan.end();
 		console.error(error, 'ERROR GENERATING IMAGE FOR WEATHER DESCRIPTION AT DESTINATION');
 		return finalWeatherDetails;
 	}
@@ -277,6 +342,25 @@ export default {
 			baseURL: env.CLOUDFLARE_GATEWAY_URL,
 		});
 
+		// Create Opik client and root trace for this request
+		const opikClient = new Opik({
+			apiKey: env.OPIK_API_KEY,
+			workspaceName: env.OPIK_WORKSPACE,
+			projectName: env.OPIK_PROJECT_NAME
+		});
+
+		const rootTrace = opikClient.trace({
+			name: 'travel-agent-orchestrator',
+			input: requestBody,
+			metadata: {
+				destination: requestBody.destination,
+				flyingFrom: requestBody.flyingFrom,
+				travelers: requestBody.travelers,
+				budget: requestBody.budget,
+				tripType: requestBody.tripType,
+			},
+		});
+
 		const finalResponse = {
 			logisticsPlanRecommendation: null as any,
 			currentWeather: null as string | null,
@@ -288,15 +372,15 @@ export default {
 			// Use Vercel AI SDK's built-in tool calling with generateText
 			const result = await generateText({
 				model: openai('gpt-4o'),
-				system: `You are a helpful AI travel agent. 
+				system: `You are a helpful AI travel agent.
 Give highly specific answers based on the information you're provided.
 You MUST use the available tools to answer questions.
 DO NOT make up information - always call the tools to get real data.
 Prefer to gather information with the tools provided to you rather than giving basic, generic answers.
 There are 2 questions that need to be answered. Ensure you answer both questions using the available tools.`,
-				prompt: `I am travelling to ${destination} on ${requestBody.fromDate} and returning on ${requestBody.toDate}. 
-I am flying from ${requestBody.flyingFrom}. 
-I am travelling with ${requestBody.travelers} people. 
+				prompt: `I am travelling to ${destination} on ${requestBody.fromDate} and returning on ${requestBody.toDate}.
+I am flying from ${requestBody.flyingFrom}.
+I am travelling with ${requestBody.travelers} people.
 My budget is $${requestBody.budget}.
 The trip is a ${requestBody.tripType} trip.
 
@@ -329,8 +413,9 @@ Answer these 2 questions:
 									budget,
 									travelers,
 									tripType,
-								}
-							));
+								}),
+								rootTrace
+							);
 						},
 					},
 					getCurrentWeather: {
@@ -340,7 +425,7 @@ Answer these 2 questions:
 						}),
 						execute: async ({ destination }) => {
 							console.log('GETTING CURRENT WEATHER');
-							return await getCurrentWeather(destination, env, env.OPENAI_API_KEY, env.CLOUDFLARE_GATEWAY_URL);
+							return await getCurrentWeather(destination, env, env.OPENAI_API_KEY, env.CLOUDFLARE_GATEWAY_URL, rootTrace);
 						},
 					},
 				},
@@ -370,6 +455,10 @@ Answer these 2 questions:
 			console.error('ERROR:', error);
 			finalResponse.failureReason = `Error: ${(error as Error).message}`;
 		}
+
+		rootTrace.update({ output: finalResponse });
+		rootTrace.end();
+		await opikClient.flush();
 
 		return new Response(JSON.stringify({ done: true, response: finalResponse }), {
 			headers: { ...allowedHeaders },
